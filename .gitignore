@@ -1,0 +1,7 @@
+/target
+.env
+docker-compose.yml
+old
+rusty-chromaprint
+.DS_Store
+.vscode
