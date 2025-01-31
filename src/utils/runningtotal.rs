@@ -13,7 +13,7 @@ impl RunningTotal {
         let vals = base_values.iter().map(|x| x.unwrap_or(0.0)).collect::<Vec<f32>>();
         Self {
             held_value: vals.clone(),
-            averages: vec![vals],
+            averages: vec![],
             bins,
             max_value
         }

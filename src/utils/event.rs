@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use tracing::warn;
+use tracing::{trace, warn};
 
 // this function will be rather internal and likely cannot be reused in many places
 
@@ -28,9 +28,11 @@ impl NominalValue {
     pub fn update(&mut self, new_value: f32) {
         if new_value < self.acceptable_range.0 || new_value > self.acceptable_range.1 {
             self.failing = Some(Utc::now());
+            warn!("Value is outside acceptable range: {}", self.get_alert_string());
         } else {
             self.current_value = new_value;
             self.failing = None;
+            trace!("Value is within acceptable range: {}", self.get_passing_string());
         }
         self.current_value = new_value;
     }

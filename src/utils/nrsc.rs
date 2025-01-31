@@ -130,7 +130,7 @@ pub fn get_hd_radio_streams(input_data: Child) -> Result<(ChildStdout, ChildStdo
         loop {
             if let Some(line) = hd1_reader.by_ref().lines().next() {
                 if let Ok(line) = line {
-                    trace!(line);
+                    //trace!(line);
                     let ber = ensure_safe_ber(&line);
                     if ber.0 == false && ber.1.is_some() {
                         warn!("BER for HD1 is in a bad state: {}", ber.1.unwrap());
@@ -145,7 +145,7 @@ pub fn get_hd_radio_streams(input_data: Child) -> Result<(ChildStdout, ChildStdo
     
             if let Some(line) = hd2_reader.by_ref().lines().next() {
                 if let Ok(line) = line {
-                    trace!(line);
+                    //trace!(line);
                     let ber = ensure_safe_ber(&line);
                     if ber.0 == false && ber.1.is_some() {
                         warn!("BER for HD2 is in a bad state: {}", ber.1.unwrap());

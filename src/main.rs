@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::{env, io, thread};
 use std::process::{Command, Stdio};
+use chrono::Utc;
 use dotenv::dotenv;
 use tracing::{info, trace, warn, Level};
 use utils::commander::Commander;
@@ -59,6 +60,7 @@ fn main() -> io::Result<()> {
     let hd1_streams = vec![
         Command::new("ffmpeg") 
         .args([
+            "-re",
             "-i", "pipe:0",
             "-ar", "44100", "-ac", "2",
             "-f", "s16le",
@@ -70,6 +72,7 @@ fn main() -> io::Result<()> {
         .spawn()?,
         Command::new("ffmpeg")
         .args([
+            "-re",
             "-i", "http://hls.wrek.org/main/live.m3u8",
             "-ar", "44100", "-ac", "2", 
             "-f", "s16le",
@@ -80,6 +83,7 @@ fn main() -> io::Result<()> {
         .spawn()?,
         Command::new("ffmpeg")
         .args([
+            "-re",
             "-i", "https://streaming.wrek.org/main/128kb.mp3",
             "-ar", "44100", "-ac", "2", 
             "-f", "s16le",
@@ -93,6 +97,7 @@ fn main() -> io::Result<()> {
     let hd2_streams = vec![
         Command::new("ffmpeg") 
         .args([
+            "-re",
             "-i", "pipe:0",
             "-ar", "44100", "-ac", "2",
             "-f", "s16le",
@@ -104,6 +109,7 @@ fn main() -> io::Result<()> {
         .spawn()?,
         Command::new("ffmpeg")
         .args([
+            "-re",
             "-i", "http://hls.wrek.org/hd2/live.m3u8",
             "-ar", "44100", "-ac", "2", 
             "-f", "s16le",
@@ -114,6 +120,7 @@ fn main() -> io::Result<()> {
         .spawn()?,
         Command::new("ffmpeg")
         .args([
+            "-re",
             "-i", "https://streaming.wrek.org/hd2/128kb.mp3",
             "-ar", "44100", "-ac", "2", 
             "-f", "s16le",
@@ -181,9 +188,11 @@ fn main() -> io::Result<()> {
     let bins = (window_size / segment_time) as usize;
     let overlap_level = 70.0; // maximum allowed overlap average
     let desync_level = 20.0; // minimum desync level
+    let non_respond_level = 30.0; // max number of seconds a channel can go without responding before it's considered dead
     
     let mut cross_channel_similarity: HashMap<(usize, usize), RunningTotal> = HashMap::new();
     let mut internal_channel_similarity: HashMap<usize, RunningTotal> = HashMap::new();
+    let mut last_talk: HashMap<(usize, usize), NominalValue> = HashMap::new();
 
     let mut events: HashMap<String, NominalValue> = HashMap::new();
 
@@ -213,6 +222,24 @@ fn main() -> io::Result<()> {
                 },
                 None => {
                     internal_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins, window_size));
+                }
+            }
+        }
+
+        // we need to watch when a thread dies
+        let last_talks = commander.get_all_channel_talks();
+        let last_talks_labels = commander.get_all_channel_talks_labels();
+        for channel in 0..last_talks.len() {
+            let talk = last_talks[channel];
+            let talk_label = last_talks_labels[channel].clone();
+            let formatted_label = format!("{}-{} LAST TALK", talk_label.0, talk_label.1);
+            let time_delta = (Utc::now()-talk.1).num_milliseconds() as f32 / 1000.0;
+            match events.get_mut(&formatted_label) {
+                Some(event) => {
+                    event.update(time_delta);
+                },
+                None => {
+                    events.insert(formatted_label.clone(), NominalValue::new(format!("{}/{} last audio data", talk_label.0, talk_label.1), (f32::NEG_INFINITY, non_respond_level)));
                 }
             }
         }
@@ -260,7 +287,7 @@ fn main() -> io::Result<()> {
                         event.update(level);
                     }
                     None => {
-                        events.insert(formatted_internal, NominalValue::new(format!("[{}] {} desync with {}", label, name.0, name.1), (desync_level, f32::INFINITY)));
+                        events.insert(formatted_internal, NominalValue::new(format!("[{}] {} synchronization with {}", label, name.0, name.1), (desync_level, f32::INFINITY)));
                     }
                 }
             }

@@ -244,6 +244,33 @@ impl Commander {
         return output;
     }
 
+    pub fn get_all_channel_talks(&self) -> Vec<((usize, usize), DateTime<Utc>)> {
+        let channel_length = self.last_packet.get(0).unwrap().len();
+        let mut output = vec![];
+        for i in 0..self.last_packet.len() {
+            for j in 0..channel_length {
+                let talk_ex = self.last_packet[i][j].lock()
+                .expect("Could not lock channel time")
+                .clone();
+                output.push(((i, j), talk_ex));
+            }
+        }
+        output
+    }
+
+    pub fn get_all_channel_talks_labels(&self) -> Vec<(String, String)> {
+        let channel_length = self.last_packet.get(0).unwrap().len();
+        let mut output = vec![];
+        for i in 0..self.last_packet.len() {
+            let thread_name = self.labels.get(i).unwrap().0.clone();
+            for j in 0..channel_length {
+                let chan_name = self.labels.get(i).unwrap().1.get(j).unwrap();
+                output.push((thread_name.clone(), chan_name.clone()));
+            }
+        }
+        output
+    }
+
     pub fn get_channel_label(&self, channel: usize) -> String { // TODO: make this an option
         self.labels.get(channel).expect("Channel is out of range").0.clone()
     }
