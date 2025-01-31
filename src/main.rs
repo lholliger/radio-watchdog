@@ -3,7 +3,7 @@ use std::time::Duration;
 use std::{env, io, thread};
 use std::process::{Command, Stdio};
 use dotenv::dotenv;
-use tracing::{info, warn, Level};
+use tracing::{info, trace, warn, Level};
 use utils::commander::Commander;
 use utils::event::{NominalValue, AlertState};
 use utils::nrsc::{generate_rtl_sdr_input, get_hd_radio_streams};
@@ -25,9 +25,14 @@ fn main() -> io::Result<()> {
 
     tracing_subscriber::fmt().with_max_level(subscriber_level).init();
 
+    for (key, value) in std::env::vars() {
+        trace!("ENV {key}: {value}");
+    }
+
     let sender = SlackMessageSender::new(
         env::var("SLACK_AUTH").expect("Could not find ENV SLACK_AUTH (Your Slack Authorization/oAuth)"),
-        env::var("SLACK_ID").expect("Could not find ENV SLACK_ID (Slack channel ID)")
+        env::var("SLACK_ID").expect("Could not find ENV SLACK_ID (Slack channel ID)"),
+        env::var("DRY_RUN").unwrap_or("false".to_string()).parse().unwrap_or(false)
     );
 
     // sender is all set up, we should start getting streams together
@@ -46,7 +51,6 @@ fn main() -> io::Result<()> {
         }
         Err(_) => {
             generate_rtl_sdr_input("91100000", env::var("SDR_GAIN").unwrap_or("5.0".to_string()).parse::<f32>().unwrap_or(5.0))
-
         }
     }.expect("Could not connect to the RTL-SDR TCP input stream!");
 
@@ -156,6 +160,8 @@ fn main() -> io::Result<()> {
         .spawn()?
     ];
 
+    let window_size = 60.0;
+
     info!("Starting commander");
     let mut commander = Commander::new(vec![hd1_streams, hd2_streams, silence],
     
@@ -166,16 +172,15 @@ fn main() -> io::Result<()> {
             vec!["Tower".to_string(), "HLS".to_string(), "MP3".to_string()]),
         ("Silence".to_string(),
             vec!["Silence".to_string(), "Silence".to_string(), "Silence".to_string()])
-    ]);
+    ], window_size);
 
     commander.begin_listening();
 
     info!("Commander is running");
-    let window_size = 60;
-    let segment_time = 10; // seconds
+    let segment_time = 10.0; // seconds, this may need some updates as the segment is kinda a rolling window
     let bins = (window_size / segment_time) as usize;
-    let overlap_level = 3.0; // maximum allowed overlap average
-    let desync_level = 3.0; // minimum desync level
+    let overlap_level = 70.0; // maximum allowed overlap average
+    let desync_level = 20.0; // minimum desync level
     
     let mut cross_channel_similarity: HashMap<(usize, usize), RunningTotal> = HashMap::new();
     let mut internal_channel_similarity: HashMap<usize, RunningTotal> = HashMap::new();
@@ -183,17 +188,17 @@ fn main() -> io::Result<()> {
     let mut events: HashMap<String, NominalValue> = HashMap::new();
 
     loop {
-        thread::sleep(Duration::from_secs(segment_time)); // we need to adjust for when the times are above 10!
+        thread::sleep(Duration::from_secs(segment_time as u64)); // this time should be above the time of an HLS segment
 
         // this is for identifying which channels are similar
         let channel_sims = commander.get_all_channel_similarities();
         for channel in channel_sims {
             match cross_channel_similarity.get_mut(&channel.0) {
                 Some(rt) => {
-                    rt.add_values(&channel.1);
+                    rt.add_values_checked(&channel.1);
                 },
                 None => {
-                    cross_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins));
+                    cross_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins, window_size));
                 }
             }
         }
@@ -204,16 +209,18 @@ fn main() -> io::Result<()> {
         for channel in channel_syncs {
             match internal_channel_similarity.get_mut(&channel.0) {
                 Some(rt) => {
-                    rt.add_values(&channel.1);
+                    rt.add_values_checked(&channel.1);
                 },
                 None => {
-                    internal_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins));
+                    internal_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins, window_size));
                 }
             }
         }
 
 
         // now we need to alert which channels are overlapping
+        // technically now we are averaging the average, so technically each avg is of previous 60 sec and then that is all averaged...
+        // this allows for us to send less false alerts, but could take 2 minutes to send an alert theoretically
         for channel in cross_channel_similarity.iter() {
             let avg = channel.1.get_average();
             if avg.is_none() {

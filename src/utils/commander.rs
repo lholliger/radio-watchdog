@@ -2,29 +2,37 @@ use std::{process::Child, sync::{Arc, Mutex}, thread};
 use std::io::Read;
 use chrono::{DateTime, Utc};
 use rusty_chromaprint::{match_fingerprints, Configuration, Fingerprinter};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 #[derive(Debug)]
 pub struct Commander {
     streams: Vec<Vec<Child>>, // each vec should be identical, then all others different
     labels: Vec<(String, Vec<String>)>,
     audio_data: Vec<Vec<Arc<Mutex<Vec<u32>>>>>,
-    last_packet: Vec<Vec<Arc<Mutex<DateTime<Utc>>>>>
+    last_packet: Vec<Vec<Arc<Mutex<DateTime<Utc>>>>>,
+    recorded_values: usize
 }
 
 
 impl Commander {
-    pub fn new(streams: Vec<Vec<Child>>, labels: Vec<(String, Vec<String>)>) -> Commander {
+    pub fn new(streams: Vec<Vec<Child>>, labels: Vec<(String, Vec<String>)>, duration: f32) -> Commander {
         let c = Commander {
             streams,
             labels,
             audio_data: vec![],
-            last_packet: vec![]
+            last_packet: vec![],
+            recorded_values: (duration / Configuration::preset_test1().item_duration_in_seconds()) as usize, // take seconds needed, divide by samples
         };
         c
     }
+
+    pub fn duration(&self) -> f32 {
+        self.recorded_values as f32 * Configuration::preset_test1().item_duration_in_seconds()
+    }
+    
     pub fn begin_listening(&mut self) {
         let mut channel_num = 0;
+        let record_size = self.recorded_values.clone();
         while !self.streams.is_empty() {
             let stream = self.streams.remove(0);
             let mut fingerprints = vec![];
@@ -56,6 +64,10 @@ impl Commander {
                             let mut fingerprint_content = cloned_for_thread.lock().unwrap();
                             fingerprint_content.clear();
                             fingerprint_content.extend(fingerprinter.fingerprint().to_vec());
+                            if fingerprint_content.len() > record_size{ // we also need to note in other systems since the running total expects this to always increase
+                                let start = fingerprint_content.len() - record_size;
+                                *fingerprint_content = fingerprint_content.split_off(start);
+                            }
                             let mut last_timestamp = packet_cloned_for_thread.lock().unwrap();
                             *last_timestamp = Utc::now();
                         }
@@ -74,8 +86,12 @@ impl Commander {
         }
     }
 
-    fn get_similarity_time_between_fingerprints(fingerprint1: Vec<u32> , fingerprint2: Vec<u32>) -> Option<f32> {
+    fn get_similarity_time_between_fingerprints(&self, fingerprint1: Vec<u32> , fingerprint2: Vec<u32>) -> Option<f32> {
         if let (Some(_), Some(_)) = (fingerprint1.first(), fingerprint2.first()) {
+            if fingerprint1.len() < self.recorded_values || fingerprint2.len() < self.recorded_values {
+                trace!("{} and {} fingerprint is too short, need {}", fingerprint1.len(), fingerprint2.len(), self.recorded_values);
+                return None;  // we must have a full fingerprint to compare
+            }
             let similarity = match_fingerprints(
                 &fingerprint1,
                 &fingerprint2,
@@ -104,7 +120,7 @@ impl Commander {
                 //let fp1_name = self.labels.get(thread).unwrap().1.get(i).unwrap();
                 //let fp2_name = self.labels.get(thread).unwrap().1.get(j).unwrap();
 
-                match Commander::get_similarity_time_between_fingerprints(
+                match self.get_similarity_time_between_fingerprints(
                     fingerprint1.to_vec(),
                     fingerprint2.to_vec()) {
                         Some(similarity) => {
@@ -146,7 +162,7 @@ impl Commander {
             let fingerprint1 = one_thread[i].lock().unwrap();
             let fingerprint2 = two_thread[i].lock().unwrap();
 
-            match Commander::get_similarity_time_between_fingerprints(
+            match self.get_similarity_time_between_fingerprints(
                 fingerprint1.to_vec(),
                 fingerprint2.to_vec()) {
                     Some(similarity) => {
@@ -181,7 +197,7 @@ impl Commander {
         return outputs;
     }
 
-    /*pub fn get_channel_durations(&self, thread: usize) -> Vec<Option<f32>> {
+    pub fn get_channel_durations(&self, thread: usize) -> Vec<Option<f32>> {
         let thread_audio = self.audio_data.get(thread).expect("Could not select thread!");
         let thread_name = &self.labels.get(thread).unwrap().0;
         let mut outputs = vec![];
@@ -189,7 +205,7 @@ impl Commander {
                 let fingerprint = thread_audio[i].lock().unwrap();
                 let fp1_name = self.labels.get(thread).unwrap().1.get(i).unwrap();
 
-                match Commander::get_similarity_time_between_fingerprints(
+                match self.get_similarity_time_between_fingerprints(
                     fingerprint.to_vec(),
                     fingerprint.to_vec()) {
                         Some(similarity) => {
@@ -203,7 +219,7 @@ impl Commander {
                     }
             }
         return outputs;
-    }*/
+    }
 
     // honestly we may need to just have a more direct "Compare channels" option since we need to also do duration to get percentages, etc
     pub fn get_all_channel_similarities(&self) -> Vec<((usize, usize), Vec<Option<f32>>)> {

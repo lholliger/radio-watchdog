@@ -1,20 +1,29 @@
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 
 pub struct SlackMessageSender {
     authorization: String,
-    channel_id: String
+    channel_id: String,
+    dry_run: bool,
 }
 
 impl SlackMessageSender {
-    pub fn new(auth: String, channel: String) -> SlackMessageSender {
+    pub fn new(auth: String, channel: String, dry_run: bool) -> SlackMessageSender {
+        if dry_run {
+            warn!("Running in DRY RUN mode, no slack messages will be sent!");
+        }
         SlackMessageSender {
             authorization: auth,
-            channel_id: channel
+            channel_id: channel,
+            dry_run
         }
     }
 
     pub fn send(&self, message: String) -> bool {
+        if self.dry_run {
+            info!("DRY RUN: Sending Slack Message: {}", message);
+            return true;
+        }
         let client = reqwest::blocking::Client::new(); // TODO: dont block
     
         match client
