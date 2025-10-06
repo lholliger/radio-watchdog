@@ -1,21 +1,83 @@
-use std::collections::HashMap;
-use std::time::Duration;
-use std::{env, io, thread};
-use std::process::{Command, Stdio};
-use chrono::Utc;
-use dotenv::dotenv;
-use tracing::{info, trace, warn, Level};
-use utils::commander::Commander;
-use utils::event::{NominalValue, AlertState};
-use utils::nrsc::{generate_rtl_sdr_input, get_hd_radio_streams};
-use utils::runningtotal::RunningTotal;
-use utils::slack::SlackMessageSender;
+use std::{collections::HashMap, fs};
+
+use clap::Parser;
+use serde::Deserialize;
+use std::sync::Arc;
+use tracing::{debug, error, info, Level};
+use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager};
 mod utils;
 
-fn main() -> io::Result<()> {
-    dotenv().ok();
+#[derive(Parser, Debug)]
+#[command(name = "watchdog")]
+#[command(about = "Audio stream monitoring and comparison tool", long_about = None)]
+struct Args {
+    /// Path to the configuration file
+    #[arg(short, long, default_value = "config.yaml")]
+    config: String,
 
-    let subscriber_level = match std::env::var("LOG_LEVEL").unwrap_or_default().as_str() {
+    /// Dry run mode - don't send Slack messages, print to terminal instead
+    #[arg(long, default_value = "false")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    slack_channel: String,
+    slack_auth: String,
+    silence: bool,
+    sdrs: Option<HashMap<String, SDR>>,
+    channels: HashMap<String, Channel>,
+    #[serde(default = "default_buffer_duration")]
+    buffer_duration: f32,
+    #[serde(default = "default_comparison_duration")]
+    comparison_duration: f32,
+    #[serde(default = "default_min_buffer_duration")]
+    min_buffer_duration: f32,
+    #[serde(default = "default_match_threshold")]
+    match_threshold: f32, // Percentage (0-100) for within-channel matching
+    #[serde(default = "default_divergence_threshold")]
+    divergence_threshold: f32, // Percentage (0-100) for cross-channel divergence
+    #[serde(default = "default_web_port")]
+    web_port: u16, // Port for web status server
+}
+
+fn default_buffer_duration() -> f32 { 120.0 }
+fn default_comparison_duration() -> f32 { 5.0 }
+fn default_min_buffer_duration() -> f32 { 30.0 }
+fn default_match_threshold() -> f32 { 85.0 }
+fn default_divergence_threshold() -> f32 { 50.0 }
+fn default_web_port() -> u16 { 3000 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct Channel {
+    streams: HashMap<String, Stream>
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+enum StreamType {
+    Web, // FFmpeg-compatible stream
+    NRSC, // stream via nrsc, which needs an input from an RTL-SDR
+    FM // TODO, however it is just an input from an RTL-SDR
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Stream {
+    r#type: StreamType,
+    host: String,
+    path: String
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SDR {
+    host: String, // could be local, or could be something we netcat in to
+    port: u16
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    let subscriber_level = match std::env::var("LOGLEVEL").unwrap_or("INFO".to_string()).to_ascii_uppercase().as_str() {
         "TRACE" => Level::TRACE,
         "DEBUG" => Level::DEBUG,
         "INFO" => Level::INFO,
@@ -26,294 +88,123 @@ fn main() -> io::Result<()> {
 
     tracing_subscriber::fmt().with_max_level(subscriber_level).init();
 
-    for (key, value) in std::env::vars() {
-        trace!("ENV {key}: {value}");
+    info!("Loading configuration from: {}", args.config);
+
+    let config_text = fs::read_to_string(&args.config);
+    if config_text.is_err() {
+        error!("Error reading config file: {}", args.config);
+        return;
+    }
+    let config: Config = match serde_yaml::from_str(&config_text.expect("Could not decode YAML to string")) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Error parsing config.yaml: {}", e);
+            return;
+        }
+    };
+
+    debug!("Using config: {:?}", config);
+
+    // lets set up slack
+    let slack = Arc::new(SlackMessageSender::new(config.slack_auth, config.slack_channel, args.dry_run));
+
+    // Set up alert manager
+    let alert_manager = Arc::new(AlertManager::new(slack.clone(), 10)); // 10 minute reminders
+    alert_manager.clone().start_alert_loop().await;
+
+    let mut router = AudioRouter::new();
+
+    info!("Configuration: buffer_duration={}s, comparison_duration={}s, min_buffer_duration={}s",
+          config.buffer_duration, config.comparison_duration, config.min_buffer_duration);
+    info!("Thresholds: match_threshold={:.1}%, divergence_threshold={:.1}%",
+          config.match_threshold, config.divergence_threshold);
+
+    // Add silence detection channel if enabled
+    if config.silence {
+        info!("Silence detection enabled, adding silence reference channel");
+        router.add_stream(
+            &"silence".to_string(),
+            &"silence".to_string(),
+            config.buffer_duration,
+            CommandHolder::new("ffmpeg", vec![
+                "-loglevel", "error",
+                "-re",
+                "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-f", "s16le",
+                "-"
+            ], None)
+        ).await;
     }
 
-    let sender = SlackMessageSender::new(
-        env::var("SLACK_AUTH").expect("Could not find ENV SLACK_AUTH (Your Slack Authorization/oAuth)"),
-        env::var("SLACK_ID").expect("Could not find ENV SLACK_ID (Slack channel ID)"),
-        env::var("DRY_RUN").unwrap_or("false".to_string()).parse().unwrap_or(false)
-    );
-
-    // sender is all set up, we should start getting streams together
-    // this weird part cant really be put into a function
-
-    info!("Generating 2 nrsc5 streams");
-
-    let input_stream = match env::var("TCP_HOST") {
-        Ok(input) => {
-            info!("TCP input provided, not generating own stream!");
-            let port = env::var("TCP_PORT").unwrap_or("1234".to_string());
-            Command::new("nc").args([input, port])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        }
-        Err(_) => {
-            generate_rtl_sdr_input("91100000", env::var("SDR_GAIN").unwrap_or("5.0".to_string()).parse::<f32>().unwrap_or(5.0))
-        }
-    }.expect("Could not connect to the RTL-SDR TCP input stream!");
-
-    let radio_streams = get_hd_radio_streams(input_stream).expect("Could not get radio streams, is nrsc5 installed and the SDR working?");
-    // create the list of HD1 and HD2 channels that must be identical
-    let hd1_streams = vec![
-        Command::new("ffmpeg") 
-        .args([
-            "-re",
-            "-i", "pipe:0",
-            "-ar", "44100", "-ac", "2",
-            "-f", "s16le",
-            "-"
-        ])
-        .stdin(radio_streams.0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-i", "http://hls.wrek.org/main/live.m3u8",
-            "-ar", "44100", "-ac", "2", 
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-i", "https://streaming.wrek.org/main/128kb.mp3",
-            "-ar", "44100", "-ac", "2", 
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?
-    ];
-
-    let hd2_streams = vec![
-        Command::new("ffmpeg") 
-        .args([
-            "-re",
-            "-i", "pipe:0",
-            "-ar", "44100", "-ac", "2",
-            "-f", "s16le",
-            "-"
-        ])
-        .stdin(radio_streams.1)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-i", "http://hls.wrek.org/hd2/live.m3u8",
-            "-ar", "44100", "-ac", "2", 
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-i", "https://streaming.wrek.org/hd2/128kb.mp3",
-            "-ar", "44100", "-ac", "2", 
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?
-    ];
-
-    let silence = vec![
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-f", "lavfi",
-            "-i", "anullsrc=r=44100:cl=stereo",
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-f", "lavfi",
-            "-i", "anullsrc=r=44100:cl=stereo",
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?,
-        Command::new("ffmpeg")
-        .args([
-            "-re",
-            "-f", "lavfi",
-            "-i", "anullsrc=r=44100:cl=stereo",
-            "-f", "s16le",
-            "-"
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?
-    ];
-
-    let window_size = 60.0;
-
-    info!("Starting commander");
-    let mut commander = Commander::new(vec![hd1_streams, hd2_streams, silence],
-    
-    vec![
-        ("HD1".to_string(),
-            vec!["Tower".to_string(), "HLS".to_string(), "MP3".to_string()]),
-        ("HD2".to_string(),
-            vec!["Tower".to_string(), "HLS".to_string(), "MP3".to_string()]),
-        ("Silence".to_string(),
-            vec!["Silence".to_string(), "Silence".to_string(), "Silence".to_string()])
-    ], window_size);
-
-    commander.begin_listening();
-
-    info!("Commander is running");
-    let segment_time = 10.0; // seconds, this may need some updates as the segment is kinda a rolling window
-    let bins = (window_size / segment_time) as usize;
-    let overlap_level = 70.0; // maximum allowed overlap average
-    let desync_level = 20.0; // minimum desync level
-    let non_respond_level = 30.0; // max number of seconds a channel can go without responding before it's considered dead
-    
-    let mut cross_channel_similarity: HashMap<(usize, usize), RunningTotal> = HashMap::new();
-    let mut internal_channel_similarity: HashMap<usize, RunningTotal> = HashMap::new();
-    let mut last_talk: HashMap<(usize, usize), NominalValue> = HashMap::new();
-
-    let mut events: HashMap<String, NominalValue> = HashMap::new();
-
-    loop {
-        thread::sleep(Duration::from_secs(segment_time as u64)); // this time should be above the time of an HLS segment
-
-        // this is for identifying which channels are similar
-        let channel_sims = commander.get_all_channel_similarities();
-        for channel in channel_sims {
-            match cross_channel_similarity.get_mut(&channel.0) {
-                Some(rt) => {
-                    rt.add_values_checked(&channel.1);
-                },
-                None => {
-                    cross_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins, window_size));
-                }
-            }
-        }
-
-
-        // this is for identifying which streams in a channel are similar
-        let channel_syncs = commander.get_all_channel_syncs();
-        for channel in channel_syncs {
-            match internal_channel_similarity.get_mut(&channel.0) {
-                Some(rt) => {
-                    rt.add_values_checked(&channel.1);
-                },
-                None => {
-                    internal_channel_similarity.insert(channel.0, RunningTotal::new(channel.1, bins, window_size));
-                }
-            }
-        }
-
-        // we need to watch when a thread dies
-        let last_talks = commander.get_all_channel_talks();
-        let last_talks_labels = commander.get_all_channel_talks_labels();
-        for channel in 0..last_talks.len() {
-            let talk = last_talks[channel];
-            let talk_label = last_talks_labels[channel].clone();
-            let formatted_label = format!("{}-{} LAST TALK", talk_label.0, talk_label.1);
-            let time_delta = (Utc::now()-talk.1).num_milliseconds() as f32 / 1000.0;
-            match events.get_mut(&formatted_label) {
-                Some(event) => {
-                    event.update(time_delta);
-                },
-                None => {
-                    events.insert(formatted_label.clone(), NominalValue::new(format!("{}/{} last audio data", talk_label.0, talk_label.1), (f32::NEG_INFINITY, non_respond_level)));
-                }
-            }
-        }
-
-
-        // now we need to alert which channels are overlapping
-        // technically now we are averaging the average, so technically each avg is of previous 60 sec and then that is all averaged...
-        // this allows for us to send less false alerts, but could take 2 minutes to send an alert theoretically
-        for channel in cross_channel_similarity.iter() {
-            let avg = channel.1.get_average();
-            if avg.is_none() {
-                continue;
-            }
-            let avg_val = avg.unwrap();
-            let names = commander.ensure_different_across_channels_labels(channel.0.0, channel.0.1);
-            for channel_check in 0..names.len() {
-                let name = names[channel_check].clone();
-                let formatted_internal = format!("{}-{} COMPARE {}-{}", name.0.0, name.0.1, name.1.0, name.1.1);
-                let level = avg_val[channel_check].clone();
-                match events.get_mut(&formatted_internal) {
-                    Some(event) => {
-                        event.update(level);
+    // we need to do some sanity checks
+    for channel in config.channels {
+        for stream in channel.1.streams {
+            match stream.1.r#type {
+                StreamType::FM | StreamType::NRSC => {
+                    match config.sdrs {
+                        None => {
+                            error!("Channel {} stream {} needs an SDR yet none are defined!", channel.0, stream.0);
+                            return;
+                        }
+                        Some(ref sdrs) => match sdrs.get(&stream.1.host) {
+                            None => {
+                                error!("Channel {} stream {} needs an SDR yet {} is not defined!", channel.0, stream.0, stream.1.host);
+                                return;
+                            }
+                            Some(sdr) => {
+                                debug!("Channel {} stream {} is using SDR {} on host {}", channel.0, stream.0, stream.1.host, sdr.host);
+                            }
+                        }
                     }
-                    None => {
-                        events.insert(formatted_internal, NominalValue::new(format!("{}/{} overlap with {}/{}", name.0.0, name.0.1, name.1.0, name.1.1), (f32::NEG_INFINITY, overlap_level)));
-                    }
-                }
-            }
-        }
-
-        for channel in internal_channel_similarity.iter() {
-            let avg = channel.1.get_average();
-            if avg.is_none() {
-                continue;
-            }
-            let avg_val = avg.unwrap();
-            let names = commander.check_thread_similarity_labels(*channel.0);
-            let label = commander.get_channel_label(*channel.0);
-            for test in 0..names.len() {
-                let name = names[test].clone();
-                let level = avg_val[test].clone();
-                let formatted_internal = format!("{} INTERNAL {} COMPARE {}", label, name.0, name.1);
-                match events.get_mut(&formatted_internal) {
-                    Some(event) => {
-                        event.update(level);
-                    }
-                    None => {
-                        events.insert(formatted_internal, NominalValue::new(format!("[{}] {} synchronization with {}", label, name.0, name.1), (desync_level, f32::INFINITY)));
-                    }
-                }
-            }
-        }
-
-        for event in events.values_mut() {
-            match event.alert_needed() {
-                AlertState::NewFailing => {
-                    warn!("New alert needed: {}", event.get_alert_string());
-                    sender.send(format!("*Warning:* _A new value is out of the expected range!_ {}", event.get_alert_string()));
-                    event.register_sent_alert();
+                    // okay, now we can start creating the stream TODO
                 },
-                AlertState::FailingReminderNeeded => {
-                    warn!("Alert reminder needed: {}", event.get_alert_string());
-                    sender.send(format!("*Reminder:* _A value is still of the expected range!_ {}", event.get_alert_string()));
-                    event.register_sent_alert();
-                },
-                AlertState::NewPassing => {
-                    warn!("Alert cleared: {}", event.get_passing_string());
-                    sender.send(format!("*Success:* *Error fixed!* {}", event.get_passing_string()));
-                    event.register_sent_alert();
-                },
-                AlertState::FailingAlertSent | AlertState::Passing => {
-                    // nothing to do
+                StreamType::Web => {
+                    let stream_name = format!("{}-{}", channel.0, stream.0);
+                    let url = format!("{}/{}", stream.1.host, stream.1.path);
+                    debug!("Adding web stream {} for {}", stream_name, url);
+                    router.add_stream(&stream_name, &channel.0, config.buffer_duration, CommandHolder::new("ffmpeg", vec![
+                        "-loglevel", "error",
+                        "-re",
+                        "-i", &url,
+                        "-ar", "44100",
+                        "-ac", "2",
+                        "-f", "s16le",
+                        "-"
+                    ], None)).await;
                 }
             }
         }
     }
+
+    // Convert router to Arc for sharing across tasks
+    let router = Arc::new(router);
+
+    // Start the supervisor to monitor stream health
+    info!("Starting AudioRouter supervisor");
+    router.start_supervisor().await;
+
+    // Start the comparator to check stream similarity
+    info!("Starting StreamComparator");
+    let comparator = StreamComparator::new(
+        router.clone(),
+        config.comparison_duration,
+        config.min_buffer_duration,
+        config.match_threshold,
+        config.divergence_threshold
+    ).with_alert_manager(alert_manager.clone());
+    comparator.start_comparison_loop().await;
+
+    // Start the web server
+    info!("Starting web server on port {}", config.web_port);
+    let web_server = WebServer::new(router.clone(), comparator.get_results());
+    tokio::spawn(async move {
+        web_server.start(config.web_port).await;
+    });
+
+    // Keep the application running
+    info!("Watchdog is now running. Press Ctrl+C to stop.");
+    info!("Web interface available at http://localhost:{}", config.web_port);
+    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    info!("Shutting down...");
 }

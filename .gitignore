@@ -1,7 +1,15 @@
 /target
 .env
 docker-compose.yml
-old
+old*
 rusty-chromaprint
 .DS_Store
 .vscode
+*.yaml
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

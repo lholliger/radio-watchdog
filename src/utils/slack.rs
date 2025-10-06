@@ -1,4 +1,4 @@
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 
 pub struct SlackMessageSender {
@@ -19,29 +19,41 @@ impl SlackMessageSender {
         }
     }
 
-    pub fn send(&self, message: String) -> bool {
+    pub async fn send(&self, message: String) -> bool {
         if self.dry_run {
             info!("DRY RUN: Sending Slack Message: {}", message);
             return true;
         }
-        let client = reqwest::blocking::Client::new(); // TODO: dont block
-    
-        match client
-        .post("https://slack.com/api/chat.postMessage")
-        .header("User-Agent", "wrek-watchdog/1.0")
-        .header("Authorization",format!("Bearer {}", self.authorization))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
+
+        let json_payload = serde_json::json!({
             "channel": self.channel_id,
             "text": message
-        })).send() {
-            Ok(pass) => {
-                trace!("HTTP PASS: {:?}", pass.text());
-                true
+        });
+        
+        let json_str = serde_json::to_string(&json_payload).unwrap();
+
+
+        let client = reqwest::Client::new()
+            .post("https://slack.com/api/chat.postMessage")
+            .header("User-Agent", "wrek-watchdog/1.0")
+            .header("Authorization", format!("Bearer {}", self.authorization))
+            .header("Content-Type", "application/json")
+            .body(json_str)
+            .send()
+            .await;
+        match client {
+            Ok(res) => {
+                if res.status().is_success() {
+                    debug!("Slack message sent successfully!");
+                    return true;
+                } else {
+                    warn!("Failed to send Slack message: {:?}", res.text().await);
+                    return false;
+                }
             },
-            Err(err) => {
-                warn!("HTTP ERROR: {:?}", err);
-                false
+            Err(e) => {
+                warn!("Failed to send slack message: {:?}", e);
+                return false;
             }
         }
     }
