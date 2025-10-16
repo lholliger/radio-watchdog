@@ -1,8 +1,10 @@
-use std::process::{Child, Command, Stdio};
+use tokio::process::Child;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::net::TcpStream;
-use tracing::{info, error, debug, warn};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command as TokioCommand;
+use tracing::{info, error, debug};
 
 pub struct SdrManager {
     host: String,
@@ -51,22 +53,47 @@ impl SdrManager {
 
         // Build the rtl_tcp command
         // rtl_tcp -a 0.0.0.0 -p <port> -f <frequency> -s <size> -g <gain>
-        let mut cmd = Command::new("rtl_tcp");
+        let mut cmd = TokioCommand::new("rtl_tcp");
         cmd.arg("-a").arg(&self.host)
             .arg("-p").arg(self.port.to_string())
             .arg("-f").arg(self.frequency.to_string())
             .arg("-s").arg(self.size.to_string())
             .arg("-g").arg(self.gain.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         debug!("Executing command: rtl_tcp -a {} -p {} -f {} -s {} -g {}",
             self.host, self.port, self.frequency, self.size, self.gain);
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.id();
                 info!("Spawned rtl_tcp process (PID: {:?}), verifying it's accepting connections...", pid);
+
+                // Capture stdout and stderr for logging
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+
+                // Spawn tasks to log output
+                if let Some(stdout) = stdout {
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            debug!("[rtl_tcp stdout] {}", line);
+                        }
+                    });
+                }
+
+                if let Some(stderr) = stderr {
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            debug!("[rtl_tcp stderr] {}", line);
+                        }
+                    });
+                }
 
                 // Store the child process
                 *process_lock = Some(child);
@@ -106,8 +133,8 @@ impl SdrManager {
                             Ok(None) => {
                                 // Process is still running but not accepting connections
                                 error!("rtl_tcp process (PID: {:?}) is running but not accepting connections on {}", pid, addr);
-                                child.kill().ok();
-                                child.wait().ok();
+                                child.kill().await.ok();
+                                child.wait().await.ok();
                                 *process_lock = None;
                                 return Err(format!("rtl_tcp not accepting connections on {}", addr));
                             }
@@ -136,9 +163,9 @@ impl SdrManager {
 
         if let Some(mut child) = process_lock.take() {
             info!("Stopping rtl_tcp process (PID: {:?})", child.id());
-            match child.kill() {
+            match child.kill().await {
                 Ok(_) => {
-                    let _ = child.wait();
+                    let _ = child.wait().await;
                     info!("Successfully stopped rtl_tcp process");
                     Ok(())
                 }
@@ -162,8 +189,7 @@ impl Drop for SdrManager {
         // Attempt to kill the process if it's still running
         if let Ok(mut process_lock) = self.process.try_lock() {
             if let Some(mut child) = process_lock.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.start_kill();
             }
         }
     }

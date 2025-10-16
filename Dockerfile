@@ -1,5 +1,5 @@
 # does this first one need to be 1-bookworm-slim?
-FROM rust:1 AS chef
+FROM rust:1-bookworm AS chef
 RUN cargo install cargo-chef 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ RUN apt-get update && \
 
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install rtl-sdr openssl ffmpeg libao4 libfftw3-dev netcat-openbsd -y
+RUN apt-get update && apt-get install rtl-sdr openssl ffmpeg libao4 libfftw3-dev netcat-openbsd libc6 -y
 WORKDIR /app
 COPY --from=nrsc-builder /app/nrsc5/build/src/nrsc5 /usr/local/bin
 COPY --from=builder /app/target/release/watchdog /usr/local/bin
