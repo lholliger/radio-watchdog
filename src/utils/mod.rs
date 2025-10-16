@@ -5,3 +5,4 @@ pub mod audiostream;
 pub mod comparator;
 pub mod webserver;
 pub mod alertmanager;
+pub mod nrsc;

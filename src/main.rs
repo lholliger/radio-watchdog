@@ -3,8 +3,8 @@ use std::{collections::HashMap, fs};
 use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{debug, error, info, Level};
-use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager};
+use tracing::{debug, error, info, warn, Level};
+use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager, nrsc::NrscManager};
 mod utils;
 
 #[derive(Parser, Debug)]
@@ -137,11 +137,29 @@ async fn main() {
         ).await;
     }
 
+    // Initialize NRSC managers for each SDR
+    let mut nrsc_managers: HashMap<String, Arc<NrscManager>> = HashMap::new();
+
+    if let Some(ref sdrs) = config.sdrs {
+        for (sdr_name, sdr_config) in sdrs {
+            info!("Initializing NRSC manager for SDR {} at {}:{}", sdr_name, sdr_config.host, sdr_config.port);
+            let nrsc_manager = Arc::new(NrscManager::new(sdr_config.host.clone(), sdr_config.port));
+            if let Err(e) = nrsc_manager.start().await {
+                error!("Failed to start NRSC manager for {}: {}", sdr_name, e);
+                return;
+            }
+            nrsc_managers.insert(sdr_name.clone(), nrsc_manager);
+        }
+    }
+
     // we need to do some sanity checks
     for channel in config.channels {
         for stream in channel.1.streams {
             match stream.1.r#type {
-                StreamType::FM | StreamType::NRSC => {
+                StreamType::FM => {
+                    error!("FM stream type is not currently supported");
+                },
+                StreamType::NRSC => {
                     match config.sdrs {
                         None => {
                             error!("Channel {} stream {} needs an SDR yet none are defined!", channel.0, stream.0);
@@ -152,12 +170,47 @@ async fn main() {
                                 error!("Channel {} stream {} needs an SDR yet {} is not defined!", channel.0, stream.0, stream.1.host);
                                 return;
                             }
-                            Some(sdr) => {
-                                debug!("Channel {} stream {} is using SDR {} on host {}", channel.0, stream.0, stream.1.host, sdr.host);
+                            Some(_sdr) => {
+                                let stream_name = format!("{}-{}", channel.0, stream.0);
+                                debug!("Adding NRSC stream {} for program {} via SDR {}", stream_name, stream.1.path, stream.1.host);
+
+                                // Get the NRSC manager for this SDR
+                                if let Some(manager) = nrsc_managers.get(&stream.1.host) {
+                                    // Add program to the manager and get the output receiver
+                                    match manager.add_program(&stream.1.path).await {
+                                        Ok(receiver) => {
+                                            // Create a CommandHolder that uses the NRSC output
+                                            // We pipe this into ffmpeg to ensure proper audio format
+                                            router.add_stream(
+                                                &stream_name,
+                                                &channel.0,
+                                                config.buffer_duration,
+                                                CommandHolder::new("ffmpeg", vec![
+                                                    "-loglevel", "error",
+                                                    "-f", "s16le",
+                                                    "-ar", "44100",
+                                                    "-ac", "2",
+                                                    "-i", "-",
+                                                    "-ar", "44100",
+                                                    "-ac", "2",
+                                                    "-f", "s16le",
+                                                    "-"
+                                                ], Some(receiver))
+                                            ).await;
+                                            info!("Added NRSC stream {} successfully", stream_name);
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to add NRSC program {} for stream {}: {}", stream.1.path, stream_name, e);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    error!("NRSC manager not found for SDR {}", stream.1.host);
+                                    return;
+                                }
                             }
                         }
                     }
-                    // okay, now we can start creating the stream TODO
                 },
                 StreamType::Web => {
                     let stream_name = format!("{}-{}", channel.0, stream.0);
