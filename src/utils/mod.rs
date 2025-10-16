@@ -6,3 +6,4 @@ pub mod comparator;
 pub mod webserver;
 pub mod alertmanager;
 pub mod nrsc;
+pub mod sdr;

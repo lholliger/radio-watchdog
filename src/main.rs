@@ -4,7 +4,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn, Level};
-use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager, nrsc::NrscManager};
+use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager, nrsc::NrscManager, sdr::SdrManager};
 mod utils;
 
 #[derive(Parser, Debug)]
@@ -70,7 +70,16 @@ struct Stream {
 #[derive(Debug, Clone, Deserialize)]
 struct SDR {
     host: String, // could be local, or could be something we netcat in to
-    port: u16
+    port: u16,
+    spawn: Option<SDRSpawnArgs>
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SDRSpawnArgs {
+    // rtl_tcp -a 0.0.0.0 -f 91.1M -s 1488375 -g -15.0
+    frequency: u32,
+    size: u32,
+    gain: f32
 }
 
 #[tokio::main]
@@ -135,6 +144,39 @@ async fn main() {
                 "-"
             ], None)
         ).await;
+    }
+
+    // Spawn rtl_tcp processes for SDRs that need them
+    let mut sdr_managers: HashMap<String, Arc<SdrManager>> = HashMap::new();
+
+    if let Some(ref sdrs) = config.sdrs {
+        for (sdr_name, sdr_config) in sdrs {
+            if let Some(ref spawn_args) = sdr_config.spawn {
+                info!("Checking if rtl_tcp needs to be spawned for SDR {} at {}:{}", sdr_name, sdr_config.host, sdr_config.port);
+                let sdr_manager = Arc::new(SdrManager::new(
+                    sdr_config.host.clone(),
+                    sdr_config.port,
+                    spawn_args.frequency,
+                    spawn_args.size,
+                    spawn_args.gain,
+                ));
+
+                match sdr_manager.spawn().await {
+                    Ok(_) => {
+                        info!("Successfully spawned and verified rtl_tcp for {}", sdr_name);
+                        sdr_managers.insert(sdr_name.clone(), sdr_manager);
+                    }
+                    Err(e) => {
+                        if e.contains("already in use") {
+                            warn!("rtl_tcp already running for {}, continuing without spawning", sdr_name);
+                        } else {
+                            error!("Failed to spawn rtl_tcp for {}: {}", sdr_name, e);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Initialize NRSC managers for each SDR
