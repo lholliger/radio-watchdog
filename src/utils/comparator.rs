@@ -87,7 +87,7 @@ impl StreamComparator {
                 // Compare across channels (should be different)
                 // This includes comparing real channels against the silence channel
                 let mut channels = router.get_all_channels();
-                channels.sort(); // Sort alphabetically for consistent ordering
+                channels.sort();
                 for i in 0..channels.len() {
                     for j in (i + 1)..channels.len() {
                         let cross_results = Self::compare_across_channels(&router, &channels[i], &channels[j], window_size, min_buffer, divergence_threshold).await;
@@ -158,7 +158,8 @@ impl StreamComparator {
         }
 
         // Compare each pair
-        let streams: Vec<_> = fingerprints.keys().cloned().collect();
+        let mut streams: Vec<_> = fingerprints.keys().cloned().collect();
+        streams.sort();
         for i in 0..streams.len() {
             for j in (i + 1)..streams.len() {
                 let fp1 = &fingerprints[&streams[i]];

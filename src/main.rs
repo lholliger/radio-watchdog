@@ -39,6 +39,8 @@ struct Config {
     divergence_threshold: f32, // Percentage (0-100) for cross-channel divergence
     #[serde(default = "default_web_port")]
     web_port: u16, // Port for web status server
+    #[serde(default = "default_grace_period")]
+    grace_period_seconds: i64, // Grace period before sending new failure alerts
 }
 
 fn default_buffer_duration() -> f32 { 120.0 }
@@ -47,6 +49,7 @@ fn default_min_buffer_duration() -> f32 { 30.0 }
 fn default_match_threshold() -> f32 { 85.0 }
 fn default_divergence_threshold() -> f32 { 50.0 }
 fn default_web_port() -> u16 { 3000 }
+fn default_grace_period() -> i64 { 60 } // Default 60 second grace period
 
 #[derive(Debug, Clone, Deserialize)]
 struct Channel {
@@ -118,7 +121,11 @@ async fn main() {
     let slack = Arc::new(SlackMessageSender::new(config.slack_auth, config.slack_channel, args.dry_run));
 
     // Set up alert manager
-    let alert_manager = Arc::new(AlertManager::new(slack.clone(), 10)); // 10 minute reminders
+    let alert_manager = Arc::new(AlertManager::new(
+        slack.clone(),
+        10, // 10 minute reminders
+        config.grace_period_seconds
+    ));
     alert_manager.clone().start_alert_loop().await;
 
     let mut router = AudioRouter::new();
