@@ -41,6 +41,8 @@ struct Config {
     web_port: u16, // Port for web status server
     #[serde(default = "default_grace_period")]
     grace_period_seconds: i64, // Grace period before sending new failure alerts
+    #[serde(default = "default_volume_detection_interval")]
+    volume_detection_interval: u64, // Interval in seconds for volume detection
 }
 
 fn default_buffer_duration() -> f32 { 120.0 }
@@ -50,6 +52,7 @@ fn default_match_threshold() -> f32 { 85.0 }
 fn default_divergence_threshold() -> f32 { 50.0 }
 fn default_web_port() -> u16 { 3000 }
 fn default_grace_period() -> i64 { 60 } // Default 60 second grace period
+fn default_volume_detection_interval() -> u64 { 10 } // Default 10 seconds
 
 #[derive(Debug, Clone, Deserialize)]
 struct Channel {
@@ -285,6 +288,10 @@ async fn main() {
     // Start the supervisor to monitor stream health
     info!("Starting AudioRouter supervisor");
     router.start_supervisor().await;
+
+    // Start the volume detection loop
+    info!("Starting volume detection loop");
+    router.start_volume_detection_loop(config.volume_detection_interval).await;
 
     // Start the comparator to check stream similarity
     info!("Starting StreamComparator");

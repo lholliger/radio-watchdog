@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use super::commandprocessor::{CommandHolder, StreamHealth};
 use super::audiostream::{AudioStream, AudioStreamHealth};
+use super::volumedetect::VolumeMetrics;
 
 pub struct StreamInfo {
     command: CommandHolder,
@@ -12,6 +13,7 @@ pub struct StreamInfo {
 pub struct AudioRouter {
     streams: Arc<Mutex<HashMap<String, StreamInfo>>>,
     channels: HashMap<String, Vec<String>>, // channel -> list of stream names
+    volume_metrics: Arc<Mutex<HashMap<String, VolumeMetrics>>>, // stream name -> volume metrics
 }
 
 impl AudioRouter {
@@ -19,6 +21,7 @@ impl AudioRouter {
         AudioRouter {
             streams: Arc::new(Mutex::new(HashMap::new())),
             channels: HashMap::new(),
+            volume_metrics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -127,5 +130,46 @@ impl AudioRouter {
 
     pub fn get_all_channels(&self) -> Vec<String> {
         self.channels.keys().cloned().collect()
+    }
+
+    pub async fn get_stream_volume(&self, stream_name: &str) -> Option<VolumeMetrics> {
+        let metrics = self.volume_metrics.lock().await;
+        metrics.get(stream_name).copied()
+    }
+
+    pub async fn get_all_stream_volumes(&self) -> HashMap<String, VolumeMetrics> {
+        self.volume_metrics.lock().await.clone()
+    }
+
+    pub async fn start_volume_detection_loop(&self, interval_seconds: u64) {
+        info!("Starting volume detection loop (interval: {}s)", interval_seconds);
+        let streams = self.streams.clone();
+        let volume_metrics = self.volume_metrics.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
+
+                let streams_lock = streams.lock().await;
+                let stream_names: Vec<String> = streams_lock.keys().cloned().collect();
+                drop(streams_lock);
+
+                // Collect volume metrics for all streams
+                let mut new_metrics = HashMap::new();
+                for stream_name in stream_names {
+                    let streams_lock = streams.lock().await;
+                    if let Some(stream_info) = streams_lock.get(&stream_name) {
+                        let metrics = stream_info.audio.get_volume_metrics().await;
+                        new_metrics.insert(stream_name.clone(), metrics);
+                        debug!("Stream '{}': mean={:.1} dB, max={:.1} dB",
+                            stream_name, metrics.mean_volume, metrics.max_volume);
+                    }
+                    drop(streams_lock);
+                }
+
+                // Update stored metrics
+                *volume_metrics.lock().await = new_metrics;
+            }
+        });
     }
 }

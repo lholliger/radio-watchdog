@@ -13,6 +13,7 @@ use super::audiorouter::AudioRouter;
 use super::audiostream::AudioStreamHealth;
 use super::commandprocessor::StreamHealth;
 use super::comparator::ComparisonResult;
+use super::volumedetect::VolumeMetrics;
 use tokio::sync::RwLock;
 
 fn format_duration(duration: chrono::Duration) -> String {
@@ -67,6 +68,9 @@ async fn status_page(State(server): State<Arc<WebServer>>) -> impl IntoResponse 
     let channels = router.get_all_channels();
     let mut channel_data = Vec::new();
 
+    // Fetch all volume metrics at once
+    let volume_metrics = router.get_all_stream_volumes().await;
+
     for channel_name in channels {
         if let Some(stream_names) = router.get_channel_streams(&channel_name) {
             let mut streams = Vec::new();
@@ -74,7 +78,8 @@ async fn status_page(State(server): State<Arc<WebServer>>) -> impl IntoResponse 
             for stream_name in stream_names {
                 if let Some((cmd_health, audio_health)) = router.get_stream_health(&stream_name).await {
                     let uptime = router.get_stream_uptime(&stream_name).await;
-                    streams.push((stream_name, cmd_health, audio_health, uptime));
+                    let volume = volume_metrics.get(&stream_name).copied();
+                    streams.push((stream_name, cmd_health, audio_health, uptime, volume));
                 }
             }
 
@@ -89,7 +94,7 @@ async fn status_page(State(server): State<Arc<WebServer>>) -> impl IntoResponse 
 }
 
 fn render_status_page(
-    channels: Vec<(String, Vec<(String, StreamHealth, AudioStreamHealth, Option<chrono::Duration>)>)>,
+    channels: Vec<(String, Vec<(String, StreamHealth, AudioStreamHealth, Option<chrono::Duration>, Option<VolumeMetrics>)>)>,
     comparison_results: Vec<ComparisonResult>
 ) -> Markup {
     html! {
@@ -295,13 +300,19 @@ fn render_status_page(
                         div.channel {
                             h2 { "Channel: " (channel_name) }
 
-                        @for (stream_name, cmd_health, audio_health, uptime) in streams {
+                        @for (stream_name, cmd_health, audio_health, uptime, volume) in streams {
                             div.stream {
                                 div {
                                     div.stream-name { (stream_name) }
                                     @if let Some(uptime) = uptime {
                                         div style="color: #888; font-size: 0.85em; margin-top: 5px;" {
                                             "Uptime: " (format_duration(uptime))
+                                        }
+                                    }
+                                    @if let Some(vol) = volume {
+                                        div style="color: #888; font-size: 0.85em; margin-top: 3px;" {
+                                            "Mean: " (format!("{:.1}", vol.mean_volume)) " dB | "
+                                            "Max: " (format!("{:.1}", vol.max_volume)) " dB"
                                         }
                                     }
                                 }

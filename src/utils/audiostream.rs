@@ -4,6 +4,7 @@ use rusty_chromaprint::{Configuration, Fingerprinter};
 use tokio::sync::{broadcast::Receiver, Mutex};
 use tracing::warn;
 use chrono::{DateTime, Utc};
+use super::volumedetect::{VolumeDetector, VolumeMetrics};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioStreamHealth {
@@ -16,7 +17,8 @@ pub enum AudioStreamHealth {
 pub struct AudioStream {
     output: Arc<Mutex<Vec<u32>>>, // fingerprint data
     health: Arc<Mutex<AudioStreamHealth>>,
-    last_fingerprint_update: Arc<Mutex<DateTime<Utc>>>
+    last_fingerprint_update: Arc<Mutex<DateTime<Utc>>>,
+    volume_detector: VolumeDetector
 }
 
 impl AudioStream {
@@ -29,10 +31,15 @@ impl AudioStream {
         let thread_health = health.clone();
         let thread_last_update = last_update.clone();
 
+        // Create a second receiver for volume detection
+        let volume_input = input.resubscribe();
+        let volume_detector = VolumeDetector::new(volume_input, buffer_duration);
+
         let stream = AudioStream {
             output,
             health,
-            last_fingerprint_update: last_update
+            last_fingerprint_update: last_update,
+            volume_detector
         };
 
         // Calculate record size based on configured buffer duration
@@ -107,5 +114,9 @@ impl AudioStream {
 
     pub async fn get_last_update(&self) -> DateTime<Utc> {
         *self.last_fingerprint_update.lock().await
+    }
+
+    pub async fn get_volume_metrics(&self) -> VolumeMetrics {
+        self.volume_detector.get_metrics().await
     }
 }
