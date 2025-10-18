@@ -4,6 +4,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
     Router,
+    http::StatusCode,
 };
 use chrono::Utc;
 use maud::{html, Markup};
@@ -48,6 +49,7 @@ impl WebServer {
         let server = Arc::new(self);
         let app = Router::new()
             .route("/", get(status_page))
+            .route("/metrics", get(metrics_endpoint))
             .with_state(server);
 
         let addr = format!("0.0.0.0:{}", port);
@@ -91,6 +93,101 @@ async fn status_page(State(server): State<Arc<WebServer>>) -> impl IntoResponse 
 
     let html = render_status_page(channel_data, comparison_results);
     Html(html.into_string())
+}
+
+async fn metrics_endpoint(State(server): State<Arc<WebServer>>) -> impl IntoResponse {
+    let router = &server.router;
+    let channels = router.get_all_channels();
+    let volume_metrics = router.get_all_stream_volumes().await;
+    let comparison_results = server.comparison_results.read().await.clone();
+
+    let mut metrics = String::new();
+
+    // Add header comments
+    metrics.push_str("# HELP watchdog_stream_health Stream health status (2=Running, 1=Stalled, 0=Dead)\n");
+    metrics.push_str("# TYPE watchdog_stream_health gauge\n");
+
+    metrics.push_str("# HELP watchdog_audio_health Audio stream health status (3=Running, 2=Degraded, 1=NoData, 0=Dead)\n");
+    metrics.push_str("# TYPE watchdog_audio_health gauge\n");
+
+    metrics.push_str("# HELP watchdog_stream_uptime_seconds Stream uptime in seconds\n");
+    metrics.push_str("# TYPE watchdog_stream_uptime_seconds gauge\n");
+
+    metrics.push_str("# HELP watchdog_volume_mean_db Mean volume level in dB\n");
+    metrics.push_str("# TYPE watchdog_volume_mean_db gauge\n");
+
+    metrics.push_str("# HELP watchdog_volume_max_db Maximum volume level in dB\n");
+    metrics.push_str("# TYPE watchdog_volume_max_db gauge\n");
+
+    metrics.push_str("# HELP watchdog_comparison_similarity_percent Stream comparison similarity percentage\n");
+    metrics.push_str("# TYPE watchdog_comparison_similarity_percent gauge\n");
+
+    metrics.push_str("# HELP watchdog_comparison_is_error Comparison error status (1=error, 0=ok)\n");
+    metrics.push_str("# TYPE watchdog_comparison_is_error gauge\n");
+
+    metrics.push_str("# HELP watchdog_comparison_offset_seconds Time offset between streams in seconds\n");
+    metrics.push_str("# TYPE watchdog_comparison_offset_seconds gauge\n");
+
+    // Collect stream metrics
+    for channel_name in channels {
+        if let Some(stream_names) = router.get_channel_streams(&channel_name) {
+            for stream_name in stream_names {
+                if let Some((cmd_health, audio_health)) = router.get_stream_health(&stream_name).await {
+                    let labels = format!("stream=\"{}\",channel=\"{}\"", stream_name, channel_name);
+
+                    // Stream health metric
+                    let health_value = match cmd_health {
+                        StreamHealth::Running => 2,
+                        StreamHealth::Stalled => 1,
+                        StreamHealth::Dead => 0,
+                    };
+                    metrics.push_str(&format!("watchdog_stream_health{{{}}} {}\n", labels, health_value));
+
+                    // Audio health metric
+                    let audio_health_value = match audio_health {
+                        AudioStreamHealth::Running => 3,
+                        AudioStreamHealth::Degraded => 2,
+                        AudioStreamHealth::NoData => 1,
+                        AudioStreamHealth::Dead => 0,
+                    };
+                    metrics.push_str(&format!("watchdog_audio_health{{{}}} {}\n", labels, audio_health_value));
+
+                    // Uptime metric
+                    if let Some(uptime) = router.get_stream_uptime(&stream_name).await {
+                        let uptime_seconds = uptime.num_seconds();
+                        metrics.push_str(&format!("watchdog_stream_uptime_seconds{{{}}} {}\n", labels, uptime_seconds));
+                    }
+
+                    // Volume metrics
+                    if let Some(volume) = volume_metrics.get(&stream_name) {
+                        metrics.push_str(&format!("watchdog_volume_mean_db{{{}}} {}\n", labels, volume.mean_volume));
+                        metrics.push_str(&format!("watchdog_volume_max_db{{{}}} {}\n", labels, volume.max_volume));
+                    }
+                }
+            }
+        }
+    }
+
+    // Comparison metrics
+    for result in comparison_results {
+        let comparison_type = if result.is_within_channel { "within_channel" } else { "cross_channel" };
+        let labels = format!(
+            "stream1=\"{}\",stream2=\"{}\",comparison_type=\"{}\"",
+            result.stream1, result.stream2, comparison_type
+        );
+
+        metrics.push_str(&format!("watchdog_comparison_similarity_percent{{{}}} {}\n",
+            labels, result.similarity_percent));
+
+        let error_value = if result.is_error { 1 } else { 0 };
+        metrics.push_str(&format!("watchdog_comparison_is_error{{{}}} {}\n", labels, error_value));
+
+        if let Some(offset) = result.offset_seconds {
+            metrics.push_str(&format!("watchdog_comparison_offset_seconds{{{}}} {}\n", labels, offset));
+        }
+    }
+
+    (StatusCode::OK, metrics)
 }
 
 fn render_status_page(
