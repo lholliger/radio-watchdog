@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
+use crate::utils::alertmanager::AlertManager;
+
 use super::commandprocessor::{CommandHolder, StreamHealth};
 use super::audiostream::{AudioStream, AudioStreamHealth};
 use super::volumedetect::VolumeMetrics;
@@ -14,6 +16,8 @@ pub struct AudioRouter {
     streams: Arc<Mutex<HashMap<String, StreamInfo>>>,
     channels: HashMap<String, Vec<String>>, // channel -> list of stream names
     volume_metrics: Arc<Mutex<HashMap<String, VolumeMetrics>>>, // stream name -> volume metrics
+    alert_manager: Option<Arc<AlertManager>>,
+    minimum_max_volume_threshold: Option<f32>
 }
 
 impl AudioRouter {
@@ -22,7 +26,15 @@ impl AudioRouter {
             streams: Arc::new(Mutex::new(HashMap::new())),
             channels: HashMap::new(),
             volume_metrics: Arc::new(Mutex::new(HashMap::new())),
+            alert_manager: None,
+            minimum_max_volume_threshold: None
         }
+    }
+
+    pub fn with_alert_manager(mut self, alert_manager: Arc<AlertManager>, minimum_max_volume_threshold: f32) -> Self {
+        self.alert_manager = Some(alert_manager);
+        self.minimum_max_volume_threshold = Some(minimum_max_volume_threshold);
+        self
     }
 
     pub async fn add_stream(&mut self, stream_name: &String, channel_name: &String, buffer_duration: f32, command_holder: CommandHolder) {
@@ -145,7 +157,8 @@ impl AudioRouter {
         info!("Starting volume detection loop (interval: {}s)", interval_seconds);
         let streams = self.streams.clone();
         let volume_metrics = self.volume_metrics.clone();
-
+        let alert_manager = self.alert_manager.clone();
+        let minimum_max_volume_threshold = self.minimum_max_volume_threshold;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
@@ -163,6 +176,18 @@ impl AudioRouter {
                         new_metrics.insert(stream_name.clone(), metrics);
                         debug!("Stream '{}': mean={:.1} dB, max={:.1} dB",
                             stream_name, metrics.mean_volume, metrics.max_volume);
+                        if let Some(ref am) = alert_manager {
+                        let alert_id = format!("{}_{}", stream_name, "silence");
+                        let is_error = metrics.max_volume < minimum_max_volume_threshold.unwrap();
+                        let message = if is_error {
+                                format!("Stream `{}` is silent ({:.1} dB, need ≥{:.1} dB)",
+                                    stream_name, metrics.max_volume, minimum_max_volume_threshold.unwrap())
+                            } else {
+                                format!("Stream `{}` is playing normally again ({:.1} dB)",
+                                    stream_name, metrics.max_volume)
+                            };
+                            am.update_alert(alert_id, is_error, message).await;
+                        }
                     }
                     drop(streams_lock);
                 }

@@ -24,7 +24,7 @@ struct Args {
 struct Config {
     slack_channel: String,
     slack_auth: String,
-    silence: bool,
+    silence: SilenceDetectType,
     sdrs: Option<HashMap<String, SDR>>,
     channels: HashMap<String, Channel>,
     #[serde(default = "default_buffer_duration")]
@@ -43,6 +43,8 @@ struct Config {
     grace_period_seconds: i64, // Grace period before sending new failure alerts
     #[serde(default = "default_volume_detection_interval")]
     volume_detection_interval: u64, // Interval in seconds for volume detection
+    #[serde(default = "default_minimum_max_volume")]
+    volume_minimum_max_volume: f32
 }
 
 fn default_buffer_duration() -> f32 { 120.0 }
@@ -53,6 +55,8 @@ fn default_divergence_threshold() -> f32 { 50.0 }
 fn default_web_port() -> u16 { 3000 }
 fn default_grace_period() -> i64 { 60 } // Default 60 second grace period
 fn default_volume_detection_interval() -> u64 { 10 } // Default 10 seconds
+fn default_minimum_max_volume() -> f32 { -70.0 } // Default -70dB
+
 
 #[derive(Debug, Clone, Deserialize)]
 struct Channel {
@@ -64,6 +68,13 @@ enum StreamType {
     Web, // FFmpeg-compatible stream
     NRSC, // stream via nrsc, which needs an input from an RTL-SDR
     FM // TODO, however it is just an input from an RTL-SDR
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+enum SilenceDetectType {
+    None, // dont silence detect
+    Match, // use stream matching using fingerprinting
+    Volume, // use the volumedetect module, helpful to determine volume_minimum_max_db
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,21 +150,27 @@ async fn main() {
           config.match_threshold, config.divergence_threshold);
 
     // Add silence detection channel if enabled
-    if config.silence {
-        info!("Silence detection enabled, adding silence reference channel");
-        router.add_stream(
-            &"silence".to_string(),
-            &"silence".to_string(),
-            config.buffer_duration,
-            CommandHolder::new("ffmpeg", vec![
-                "-loglevel", "error",
-                "-re",
-                "-f", "lavfi",
-                "-i", "anullsrc=r=44100:cl=stereo",
-                "-f", "s16le",
-                "-"
-            ], None)
-        ).await;
+    match config.silence {
+        SilenceDetectType::Match => {
+            info!("Silence detection enabled, adding silence reference channel");
+            router.add_stream(
+                &"silence".to_string(),
+                &"silence".to_string(),
+                config.buffer_duration,
+                CommandHolder::new("ffmpeg", vec![
+                    "-loglevel", "error",
+                    "-re",
+                    "-f", "lavfi",
+                    "-i", "anullsrc=r=44100:cl=stereo",
+                    "-f", "s16le",
+                    "-"
+                ], None)
+            ).await;
+        },
+        SilenceDetectType::Volume => {
+            info!("Using volume detection with level {:.1} dB warning level", config.volume_minimum_max_volume);
+        }
+        SilenceDetectType::None => info!("No silence detection.")
     }
 
     // Spawn rtl_tcp processes for SDRs that need them
@@ -283,7 +300,11 @@ async fn main() {
     }
 
     // Convert router to Arc for sharing across tasks
-    let router = Arc::new(router);
+    let router = if config.silence == SilenceDetectType::Volume {
+        Arc::new(router.with_alert_manager(alert_manager.clone(), config.volume_minimum_max_volume))
+    } else {
+        Arc::new(router)
+    };
 
     // Start the supervisor to monitor stream health
     info!("Starting AudioRouter supervisor");
