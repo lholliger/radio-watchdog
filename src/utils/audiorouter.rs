@@ -88,7 +88,12 @@ impl AudioRouter {
                         StreamHealth::Running => {
                             match audio_health {
                                 AudioStreamHealth::Dead => {
-                                    error!("Stream {} audio processing is dead", name);
+                                    error!("Stream {} audio processing is dead, attempting respawn", name);
+                                    if stream_info.command.respawn().await {
+                                        info!("Stream {} successfully respawned due to dead audio", name);
+                                    } else {
+                                        error!("Stream {} failed to respawn (max restarts exceeded)", name);
+                                    }
                                 },
                                 AudioStreamHealth::Degraded => {
                                     warn!("Stream {} audio processing degraded", name);
