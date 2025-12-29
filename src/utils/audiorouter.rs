@@ -202,4 +202,33 @@ impl AudioRouter {
             }
         });
     }
+
+    pub async fn get_all_streams(&self) -> Vec<(String, StreamHealth, super::audiostream::AudioStreamHealth)> {
+        let streams = self.streams.lock().await;
+        let mut result = Vec::new();
+
+        for (name, stream_info) in streams.iter() {
+            let cmd_health = stream_info.command.get_health().await;
+            let audio_health = stream_info.audio.get_health().await;
+            result.push((name.clone(), cmd_health, audio_health));
+        }
+
+        result
+    }
+
+    pub async fn restart_stream(&self, stream_name: &str) -> Result<(), String> {
+        let mut streams = self.streams.lock().await;
+
+        match streams.get_mut(stream_name) {
+            Some(stream_info) => {
+                info!("Restarting stream '{}' via command", stream_name);
+                if stream_info.command.respawn().await {
+                    Ok(())
+                } else {
+                    Err("Max restarts exceeded".to_string())
+                }
+            }
+            None => Err(format!("Stream '{}' not found", stream_name)),
+        }
+    }
 }

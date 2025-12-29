@@ -4,7 +4,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn, Level};
-use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, webserver::WebServer, alertmanager::AlertManager, nrsc::NrscManager, sdr::SdrManager};
+use utils::{audiorouter::AudioRouter, commandprocessor::CommandHolder, comparator::StreamComparator, slack::SlackMessageSender, slacklistener::SlackListener, webserver::WebServer, alertmanager::AlertManager, nrsc::NrscManager, sdr::SdrManager};
 mod utils;
 
 #[derive(Parser, Debug)]
@@ -23,7 +23,9 @@ struct Args {
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     slack_channel: String,
-    slack_auth: String,
+    slack_auth: String, // Bot token (xoxb-...)
+    slack_app_token: Option<String>, // App-level token for Socket Mode (xapp-...)
+    slack_bot_user_id: Option<String>, // Bot's user ID (U0829LK8DFE)
     silence: SilenceDetectType,
     sdrs: Option<HashMap<String, SDR>>,
     channels: HashMap<String, Channel>,
@@ -331,6 +333,27 @@ async fn main() {
     tokio::spawn(async move {
         web_server.start(config.web_port).await;
     });
+
+    // Start the Slack listener if app token is provided
+    if let Some(app_token) = config.slack_app_token {
+        let bot_user_id = config.slack_bot_user_id.unwrap_or_else(|| {
+            warn!("slack_bot_user_id not configured, Slack listener may not work correctly");
+            "UNKNOWN".to_string()
+        });
+        info!("Starting Slack Socket Mode listener (bot user ID: {})", bot_user_id);
+        let mut slack_listener = SlackListener::new(
+            app_token,
+            bot_user_id,
+            slack.clone(),
+            router.clone(),
+            args.dry_run
+        );
+        tokio::spawn(async move {
+            slack_listener.start().await;
+        });
+    } else {
+        info!("Slack Socket Mode disabled (no app token provided)");
+    }
 
     // Keep the application running
     info!("Watchdog is now running. Press Ctrl+C to stop.");

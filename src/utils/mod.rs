@@ -1,4 +1,5 @@
 pub mod slack;
+pub mod slacklistener;
 pub mod commandprocessor;
 pub mod audiorouter;
 pub mod audiostream;
